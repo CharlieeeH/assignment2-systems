@@ -21,7 +21,10 @@ writes one snapshot per mode for https://pytorch.org/memory_viz:
         --measurement-steps 1 --memory-profile --memory-snapshot-dir snapshots
 
 CUDA out-of-memory errors are caught and reported per mode (status "oom")
-instead of crashing, so sweeps over large configurations keep going.
+instead of crashing, so sweeps over large configurations keep going. Under
+WSL2 the driver does not raise OOM at the VRAM limit; it silently spills into
+system RAM and gets ~100x slower. The script therefore caps PyTorch at 0.95 of
+VRAM there by default (--memory-fraction overrides, 1 disables the cap).
 """
 
 from __future__ import annotations
@@ -31,6 +34,7 @@ import gc
 import json
 import logging
 import math
+import platform
 import statistics
 from collections.abc import Callable
 from contextlib import nullcontext
@@ -83,8 +87,7 @@ class BenchmarkResult:
     min_ms: float | None = None
     max_ms: float | None = None
     measurements_ms: list[float] = field(default_factory=list)
-    # Per-phase breakdown of the same steps. On CUDA this uses events, so the
-    # total above is measured without any extra host synchronization.
+    # Per-phase breakdown of the same steps, synchronized at phase boundaries.
     phases: dict[str, PhaseStats] = field(default_factory=dict)
     peak_memory_mib: float | None = None
     memory_snapshot: str | None = None
@@ -126,28 +129,25 @@ def annotated_scaled_dot_product_attention(Q, K, V, mask=None):
 
 
 class PhaseTimer:
-    """Marks phase boundaries inside one step; read the durations after a sync."""
+    """Marks phase boundaries inside one step with host timers.
+
+    Each mark synchronizes first, so a phase's time covers exactly the GPU work
+    queued since the previous mark. CUDA events would avoid those syncs, but
+    their timestamps are unreliable under WDDM/WSL2 (phases came out longer
+    than the whole step there), and the extra syncs cost little here because
+    every phase is GPU-bound.
+    """
 
     def __init__(self, device: torch.device) -> None:
-        self.use_events = device.type == "cuda"
-        self.marks: list[tuple[str, torch.cuda.Event | float]] = []
+        self.device = device
+        self.marks: list[tuple[str, float]] = []
 
     def mark(self, name: str) -> None:
-        if self.use_events:
-            event = torch.cuda.Event(enable_timing=True)
-            event.record()
-            self.marks.append((name, event))
-        else:
-            self.marks.append((name, default_timer()))
+        synchronize(self.device)
+        self.marks.append((name, default_timer()))
 
     def durations_ms(self) -> dict[str, float]:
-        durations = {}
-        for (_, start), (name, end) in zip(self.marks, self.marks[1:]):
-            if self.use_events:
-                durations[name] = start.elapsed_time(end)
-            else:
-                durations[name] = (end - start) * 1_000
-        return durations
+        return {name: (end - start) * 1_000 for (_, start), (name, end) in zip(self.marks, self.marks[1:])}
 
 
 def run_step(
@@ -351,6 +351,13 @@ def parse_args() -> argparse.Namespace:
         help="record CUDA allocations during the measured steps and dump a snapshot per mode",
     )
     parser.add_argument("--memory-snapshot-dir", default="memory_snapshots")
+    parser.add_argument(
+        "--memory-fraction",
+        type=float,
+        default=None,
+        help="cap PyTorch's CUDA memory at this fraction of VRAM so an over-sized config raises OOM; "
+        "defaults to 0.95 under WSL2, where the driver otherwise silently spills into system RAM",
+    )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--json", action="store_true", help="print machine-readable JSON")
@@ -370,6 +377,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--memory-profile requires a CUDA device")
     if args.annotate_attention and not args.device.startswith("cuda"):
         parser.error("--annotate-attention requires a CUDA device")
+    if args.memory_fraction is not None and not 0 < args.memory_fraction <= 1:
+        parser.error("--memory-fraction must be in (0, 1]")
     return args
 
 
@@ -383,6 +392,12 @@ def main() -> None:
     torch.manual_seed(args.seed)
     if device.type == "cuda":
         torch.cuda.manual_seed_all(args.seed)
+        memory_fraction = args.memory_fraction
+        if memory_fraction is None and "microsoft" in platform.uname().release.lower():
+            memory_fraction = 0.95
+        if memory_fraction is not None and memory_fraction < 1:
+            torch.cuda.set_per_process_memory_fraction(memory_fraction, device)
+            LOGGER.info("CUDA memory capped at fraction=%.2f of VRAM", memory_fraction)
 
     if args.annotate_attention:
         # model.py looks the function up as a module global at call time.
